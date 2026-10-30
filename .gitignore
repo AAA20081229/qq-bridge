@@ -66,3 +66,7 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# ── 本地补丁：AI 的日记与私人人格卡，绝不入库 ──────────────────────────────
+# diary/ 是它自己写的东西（含真实聊天内容），roles/小鲸.md 里含真实 QQ 号。
+diary/
+roles/小鲸.md

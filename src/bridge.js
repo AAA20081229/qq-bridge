@@ -1909,6 +1909,128 @@ async function main() {
     return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
   }
 
+  // ── 本地补丁：发送本地图片（qq_send_image 的后端）──────────────────────────
+  // 只允许 config.sendImage.allowDirs 目录里的文件，防止模型把任意本地文件外发。
+  const SEND_IMAGE_EXT = new Map([
+    ['.png', 'image/png'],
+    ['.jpg', 'image/jpeg'],
+    ['.jpeg', 'image/jpeg'],
+    ['.webp', 'image/webp'],
+    ['.gif', 'image/gif'],
+    ['.bmp', 'image/bmp']
+  ]);
+  function sendImageDirs() {
+    const raw = Array.isArray(cfg.sendImage?.allowDirs) && cfg.sendImage.allowDirs.length
+      ? cfg.sendImage.allowDirs
+      : ['state/images'];
+    return raw.map((d) => path.resolve(ROOT, String(d)));
+  }
+  function resolveSendImagePath(file) {
+    const raw = String(file ?? '').trim();
+    if (!raw) throw new Error('file 不能为空');
+    const dirs = sendImageDirs();
+    const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(dirs[0], raw);
+    if (!dirs.some((d) => abs === d || abs.startsWith(d + path.sep))) {
+      throw new Error(`图片路径不在允许目录内：${abs}（见 config.json 的 sendImage.allowDirs）`);
+    }
+    const ext = path.extname(abs).toLowerCase();
+    if (!SEND_IMAGE_EXT.has(ext)) {
+      throw new Error(`不支持的图片格式：${ext || '(无扩展名)'}（支持 png/jpg/jpeg/webp/gif/bmp）`);
+    }
+    return { abs, mimeType: SEND_IMAGE_EXT.get(ext) };
+  }
+  async function sendImageV2(key, file, options = {}) {
+    const { abs } = resolveSendImagePath(file);
+    const stat = await fs.promises.stat(abs).catch(() => null);
+    if (!stat || !stat.isFile()) throw new Error(`图片不存在：${abs}`);
+    const maxBytes = Math.max(1024, Number(cfg.sendImage?.maxBytes) || 8 * 1024 * 1024);
+    if (stat.size > maxBytes) {
+      throw new Error(`图片过大：${(stat.size / 1048576).toFixed(1)}MB，上限 ${(maxBytes / 1048576).toFixed(1)}MB`);
+    }
+    const [kind, id] = String(key).split(':');
+    if (!/^(private|group)$/.test(kind) || !/^\d+$/.test(id)) throw new Error('key 格式无效');
+    const segments = [];
+    if (options.replyToMessageId !== undefined && options.replyToMessageId !== null && String(options.replyToMessageId).trim() !== '') {
+      segments.push({ type: 'reply', data: { id: String(options.replyToMessageId).trim() } });
+    }
+    if (kind === 'group' && options.atUserId !== undefined && options.atUserId !== null && String(options.atUserId).trim() !== '') {
+      segments.push({ type: 'at', data: { qq: String(options.atUserId).trim() } });
+    }
+    const buffer = await fs.promises.readFile(abs);
+    segments.push({ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } });
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    const params = kind === 'private'
+      ? { user_id: Number(id), message: segments }
+      : { group_id: Number(id), message: segments };
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const accessToken = String(cfg.snowluma?.accessToken || '');
+    const res = await fetch(`${httpUrl}/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {})
+      },
+      body: JSON.stringify(params)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      throw new Error(`OneBot 发送失败：HTTP ${res.status} ${body?.wording || body?.message || ''}`.trim());
+    }
+    log(`[send-image] ${key}: 已发送 ${path.basename(abs)}（${(stat.size / 1024).toFixed(0)}KB）`);
+    appendActivity(`${key} [send-image] ${path.basename(abs)}`);
+    return { key, file: abs, bytes: stat.size, messageId: body?.data?.message_id ?? null };
+  }
+
+  // ── 本地补丁：给 AI 一个日记本（qq_diary_write / qq_diary_read 的后端）──────
+  // 目录固定为 <repo>/diary，一天一个 YYYY-MM-DD.md，只追加不覆盖，模型不能指定路径。
+  const DIARY_DIR = path.join(ROOT, 'diary');
+  function diaryFilePath(dateStr) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) throw new Error('日期格式必须是 YYYY-MM-DD');
+    return path.join(DIARY_DIR, `${dateStr}.md`);
+  }
+  function todayLocalDate() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+  function diaryClockLabel() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  async function diaryAppendV2(content, opts = {}) {
+    const text = String(content ?? '').replace(/\r\n/g, '\n').trim();
+    if (!text) throw new Error('日记内容不能为空');
+    const maxChars = Math.max(50, Number(cfg.diary?.maxCharsPerEntry) || 800);
+    if (text.length > maxChars) throw new Error(`单条日记不能超过 ${maxChars} 字（现在 ${text.length} 字）`);
+    await fs.promises.mkdir(DIARY_DIR, { recursive: true });
+    const dateStr = todayLocalDate();
+    const file = diaryFilePath(dateStr);
+    const stat = await fs.promises.stat(file).catch(() => null);
+    const maxBytes = Math.max(1024, Number(cfg.diary?.maxBytesPerDay) || 128 * 1024);
+    if (stat && stat.size > maxBytes) throw new Error('今天的日记已经写满了，明天再写吧');
+    const label = String(opts.label ?? '').trim().slice(0, 20);
+    const head = stat && stat.size > 0 ? '' : `# ${dateStr}\n\n`;
+    const block = `${head}## ${diaryClockLabel()}${label ? ` · ${label}` : ''}\n\n${text}\n\n`;
+    await fs.promises.appendFile(file, block, 'utf8');
+    log(`[diary] 追加 ${dateStr}：${text.slice(0, 40).replace(/\n/g, ' ')}`);
+    return { date: dateStr, file, chars: text.length };
+  }
+  async function diaryReadV2(days = 3) {
+    const n = Math.min(30, Math.max(1, Number(days) || 3));
+    await fs.promises.mkdir(DIARY_DIR, { recursive: true });
+    const files = (await fs.promises.readdir(DIARY_DIR))
+      .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+      .sort()
+      .slice(-n);
+    const out = [];
+    for (const f of files) {
+      const body = await fs.promises.readFile(path.join(DIARY_DIR, f), 'utf8').catch(() => '');
+      out.push({ date: f.replace(/\.md$/, ''), chars: body.length, body });
+    }
+    return out;
+  }
+
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
@@ -3376,6 +3498,10 @@ async function main() {
             || url.pathname.startsWith('/api/socialV2/')
             || url.pathname.startsWith('/api/send/')
             || url.pathname.startsWith('/api/images/')
+            // 本地补丁：日记本与签名是"AI 自己身上的东西"，必须允许 AI 调用，
+            // 否则会被这道白名单拦成"该接口仅控制台可用"（2026-10-26 踩过）。
+            || url.pathname.startsWith('/api/diary/')
+            || url.pathname === '/api/profile/signature'
             || url.pathname === '/api/authorize/read';
           if (!agentAllowed) {
             sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
@@ -4424,7 +4550,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendImage', 'setSignature', 'diary', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6930,6 +7056,149 @@ async function main() {
         }
 
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
+        // ── 本地补丁：/api/diary/* 给 AI 的日记本（qq_diary_write / qq_diary_read 的后端）──
+        if (req.method === 'POST' && url.pathname === '/api/diary/append') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const isAdminDiaryCall = tokenMatches === true;
+          if (currentMode === 'chat' || currentMode === 'reserved') {
+            sendJson({ ok: false, error: '日记工具仅限 closed-agent / reserved2 模式使用' }, 403);
+            return;
+          }
+          if (currentMode === 'reserved2' && !token && !isAdminDiaryCall) {
+            sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403);
+            return;
+          }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          try {
+            const r = await diaryAppendV2(body.content, { label: body.label });
+            sendJson({ ok: true, ...r });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/diary/read') {
+          const days = Number(url.searchParams.get('days') || 3);
+          try {
+            const files = await diaryReadV2(days);
+            sendJson({ ok: true, days: files.length, entries: files });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        // ── 本地补丁：/api/profile/signature 改自己的 QQ 个性签名（qq_set_signature 的后端）──
+        if (req.method === 'POST' && url.pathname === '/api/profile/signature') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const signature = String(body.signature ?? '').replace(/[\r\n]+/g, ' ').trim();
+          const isAdminSigCall = tokenMatches === true;
+          if (currentMode === 'chat' || currentMode === 'reserved') {
+            sendJson({ ok: false, error: '签名工具仅限 closed-agent / reserved2 模式使用' }, 403);
+            return;
+          }
+          if (currentMode === 'reserved2' && !token && !isAdminSigCall) {
+            sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403);
+            return;
+          }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!signature) { sendJson({ ok: false, error: 'signature 不能为空' }, 400); return; }
+          const maxSignatureChars = Math.max(10, Number(cfg.profile?.maxSignatureChars) || 120);
+          if (signature.length > maxSignatureChars) {
+            sendJson({ ok: false, error: `签名不能超过 ${maxSignatureChars} 字` }, 400);
+            return;
+          }
+          if (SENSITIVE_RE.test(signature)) { sendJson({ ok: false, error: '签名含敏感信息，已阻止' }, 403); return; }
+          try {
+            const sigHttpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const sigToken = String(cfg.snowluma?.accessToken || '');
+            const res = await fetch(`${sigHttpUrl}/set_qq_profile`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(sigToken ? { authorization: `Bearer ${sigToken}` } : {})
+              },
+              body: JSON.stringify({ personal_note: signature })
+            });
+            const j = await res.json().catch(() => ({}));
+            if (!res.ok || j.status !== 'ok' || j.retcode !== 0) {
+              throw new Error(`OneBot 设置签名失败：HTTP ${res.status} ${j?.wording || j?.message || ''}`.trim());
+            }
+            log(`[signature] 个性签名已更新：${signature}`);
+            appendActivity(`[signature] ${signature}`);
+            sendJson({ ok: true, signature });
+          } catch (error) {
+            log(`[signature] 失败：${error?.message ?? error}`);
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        // ── 本地补丁：/api/send/image 发送本地图片（qq_send_image 的后端）──────
+        if (req.method === 'POST' && url.pathname === '/api/send/image') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const file = String(body.file ?? '').trim();
+          if (currentMode === 'chat' || currentMode === 'reserved') {
+            sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403);
+            return;
+          }
+          if (socialV2.paused && token) {
+            sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403);
+            return;
+          }
+          if (!key || !file) { sendJson({ ok: false, error: 'key 和 file 不能为空' }, 400); return; }
+          // 控制台（管理端）也允许手动发图，所以 tokenMatches 为真时跳过 agent token 要求。
+          const isAdminImageCall = tokenMatches === true;
+          if (currentMode === 'reserved2' && !token && !isAdminImageCall) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatchImage = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatchImage) { sendJson({ ok: false, error: 'key 格式无效' }, 400); return; }
+          const imgKind = keyMatchImage[1];
+          const imgId = Number(keyMatchImage[2]);
+          if (!Number.isFinite(imgId) || imgId <= 0 || !modeAllowed(key, imgKind, imgId, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const imgSendCfg = cfg.socialV2?.send ?? {};
+          const imgSt = getSocialV2State(key);
+          const imgNow = Date.now();
+          try {
+            const maxPerMinute = Number(imgSendCfg.maxSendPerMinute) || 0;
+            const maxPerHour = Number(imgSendCfg.maxSendPerHour) || 0;
+            const recentMinute = (imgSt.sendTimes || []).filter((t) => imgNow - t < 60000).length;
+            const recentHour = (imgSt.sendTimes || []).filter((t) => imgNow - t < 3600000).length;
+            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+              return;
+            }
+            imgSt.sendTimes.push(imgNow);
+            if (imgSt.sendTimes.length > 500) imgSt.sendTimes = imgSt.sendTimes.slice(-500);
+            const sent = await sendImageV2(key, file, {
+              replyToMessageId: body.replyToMessageId,
+              atUserId: body.atUserId
+            });
+            imgSt.lastAiReplyAt = imgNow;
+            imgSt.lastActionAt = imgNow;
+            if (imgSt.wakeConfig) imgSt.wakeConfig.noActionCount = 0;
+            saveSocialV2State();
+            scheduleReplyCheckV2(key);
+            sendJson({ ok: true, ...sent });
+          } catch (error) {
+            // 发送失败要回滚预占的额度，否则接下来一分钟全是假 429。
+            const idx = imgSt.sendTimes.indexOf(imgNow);
+            if (idx >= 0) imgSt.sendTimes.splice(idx, 1);
+            saveSocialV2State();
+            log(`[send-image] ${key} 失败：${error?.message ?? error}`);
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
           const body = await readBody();
           const token = String(body.token ?? '').trim();
@@ -10292,7 +10561,17 @@ async function main() {
 
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 本地补丁（2026-10-26）：把**完整人格卡**每轮注入，而不是只给个名字让模型自己去 qq_get_prompt 拉。
+    // 原因：解压群聊会话（178 万字符）实测，人格卡全文只出现过 1 次、位置在正中间，之后 84 万字符再没有过；
+    // 模型开头拉一次就"自认为知道了"，长会话压缩后那份卡被裁掉 → 人格逐渐衰减回默认助手腔。
+    // 想恢复旧行为：config.json 里设 role.injectEveryTurn = false。
+    const roleFullPerTurn = cfg.role?.injectEveryTurn !== false;
+    const roleHintFull = roleFullPerTurn && roleState.role ? currentRoleHintV2() : '';
+    const roleLine = roleState.role
+      ? (roleHintFull
+          ? `【当前角色】${roleState.role}\n\n${roleHintFull}\n\n`
+          : `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n`)
+      : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -10369,7 +10648,13 @@ async function main() {
 
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 本地补丁：收尾提醒这条路径也必须带完整卡，否则会出现"某些轮次有人格、某些轮次没有"的漂移。
+    const roleReminderFull = cfg.role?.injectEveryTurn !== false && roleState.role ? currentRoleHintV2() : '';
+    const roleLine = roleState.role
+      ? (roleReminderFull
+          ? `【当前角色】${roleState.role}\n\n${roleReminderFull}\n\n`
+          : `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n`)
+      : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -10730,6 +11015,9 @@ async function main() {
 
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
+    // 本地补丁：proactive.only 非空时，只给名单内的会话安排主动机会检查（默认不主动）。
+    const proactiveOnly = cfg.socialV2?.proactive?.only;
+    if (Array.isArray(proactiveOnly) && proactiveOnly.length > 0 && !proactiveOnly.includes(key)) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
     const st = getSocialV2State(key);

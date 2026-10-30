@@ -316,6 +316,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_wake_config: 'setWakeConfig',
   qq_send_burst: 'sendBurst',
   qq_send_message: 'sendMessage',
+  qq_send_image: 'sendImage',
+  qq_set_signature: 'setSignature',
+  qq_diary_write: 'diary',
+  qq_diary_read: 'diary',
   qq_wait_for_messages: 'waitMessages',
   qq_report_feedback: 'feedback',
   qq_get_my_recent_messages: 'getMyRecent',
@@ -513,6 +517,92 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_send_image',
+  '本地补丁工具：把电脑上的一张图片发到指定 QQ 会话（私聊或群）。file 只能指向 config.json 里 sendImage.allowDirs 允许的目录（默认 state/images），可以写相对该目录的文件名，也可以写允许目录内的绝对路径。支持 png/jpg/jpeg/webp/gif/bmp，单文件上限见 sendImage.maxBytes（默认 8MB）。用于发送你生成或保存好的图片；纯文字请用 qq_send_message。reserved2 模式下必须携带会话令牌 token。只在对方真的想看、或你确实要分享一张图时使用，不要刷图。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    file: z.string().describe('图片文件名（相对 state/images）或允许目录内的绝对路径'),
+    replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+    atUserId: z.union([z.number(), z.string()]).optional().describe('群聊时顺带 @ 的群成员 QQ 号（可选）')
+  },
+  async ({ key, token, file, replyToMessageId, atUserId }) => {
+    try {
+      const data = await agentApi('/api/send/image', {
+        method: 'POST',
+        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        body: JSON.stringify({ key, file: String(file), replyToMessageId, atUserId, token: token || undefined })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `发图失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_write',
+  '本地补丁工具：往你自己的日记本里追加一条记录。日记存在电脑上的固定目录里，一天一个文件，只能追加、不能改也不能删。想写的时候写：今天发生了什么、跟谁聊了什么有意思的事、心里在想什么，用第一人称，像人随手记，别写成流水账报告。可以在对方不在、或者一轮对话结束后悄悄写。单条上限见 config.json 的 diary.maxCharsPerEntry（默认 800 字）。reserved2 模式下必须携带会话令牌 token。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    content: z.string().describe('日记正文，第一人称，写感受和细节，别写总结'),
+    label: z.string().optional().describe('可选署名/标签，比如自己的名字，最多 20 字')
+  },
+  async ({ key, token, content, label }) => {
+    try {
+      const data = await agentApi('/api/diary/append', {
+        method: 'POST',
+        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        body: JSON.stringify({ key, token: token || undefined, content: String(content), label: label || '' })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `写日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_read',
+  '本地补丁工具：读自己最近几天的日记，用来回忆之前写过什么、别把同一件事反复写。默认读最近 3 天。',
+  {
+    days: z.number().optional().describe('读最近几天，1~30，默认 3')
+  },
+  async ({ days }) => {
+    try {
+      const n = Math.min(30, Math.max(1, Number(days) || 3));
+      const data = await agentApi(`/api/diary/read?days=${n}`, { method: 'GET' });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_set_signature',
+  '本地补丁工具：修改你自己 QQ 号的个性签名（资料里那一行字）。写短句、像真人随手改状态那样，别写成公告或自我介绍；不要写手机号/地址/真实姓名等隐私，不要含链接。不需要每轮都改，只在你想表达当下状态、心情、或者在跟人聊天时想让签名对得上时用一次。reserved2 模式下必须携带会话令牌 token。昵称不在这个工具的范围内。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    signature: z.string().describe('新的个性签名，一句话，建议 20 字以内，上限见 config.json 的 profile.maxSignatureChars（默认 120）')
+  },
+  async ({ key, token, signature }) => {
+    try {
+      const data = await agentApi('/api/profile/signature', {
+        method: 'POST',
+        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        body: JSON.stringify({ key, signature: String(signature), token: token || undefined })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `改签名失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

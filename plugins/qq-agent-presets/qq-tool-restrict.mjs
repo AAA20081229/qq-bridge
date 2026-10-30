@@ -216,6 +216,9 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // 本地补丁：QQ 空间 MCP（发说说/看动态/点赞/评论）。只放只读+发说说这一个命名空间，
+  // 实现在 ai-companion-kit 的 qzone-mcp，工具名形如 mcp__qzone__qzone_post。
+  'mcp__qzone__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
